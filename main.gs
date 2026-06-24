@@ -5,7 +5,16 @@
 //    스포티파이 앱에서 해당 유저 프로필 → 공유 → "프로필 링크 복사"
 //    https://open.spotify.com/user/abcd1234?si=... 에서 "abcd1234" 부분이 ID 입니다.
 //
-// 2) ⚠️ 한계점 (반드시 인지하고 사용하세요):
+// 2) ✅ 스크립트 속성 설정 (최초 1회 필수):
+//    GAS 에디터 → 프로젝트 설정 → 스크립트 속성 → 속성 추가
+//    ┌─────────────────────┬──────────────────────────────────────┐
+//    │ 속성 이름           │ 값                                   │
+//    ├─────────────────────┼──────────────────────────────────────┤
+//    │ DISCORD_WEBHOOK_URL │ 디스코드 웹훅 URL                     │
+//    │ TARGET_USER_ID      │ 감시할 스포티파이 유저 ID             │
+//    └─────────────────────┴──────────────────────────────────────┘
+//
+// 3) ⚠️ 한계점 (반드시 인지하고 사용하세요):
 //    - 이 코드는 헤드리스 브라우저 없이 open.spotify.com/user/{ID} 페이지의
 //      "서버에서 미리 렌더링된 부분"만 긁어옵니다(JS 실행 X).
 //      실험 결과 이 페이지는 보통 상위 10개 정도의 플레이리스트만 미리 렌더링되고,
@@ -17,15 +26,17 @@
 //      → 감시 대상 유저의 고정 공개 플레이리스트가 10개 이하라면 이 문제는 거의 없습니다.
 //    - 스포티파이는 "플레이리스트 공개"와 "프로필에 추가(고정)"를 별개로 취급합니다.
 //      프로필에 추가되지 않은 공개 플레이리스트는 이 방식으로 아예 안 보입니다.
-//    - 기존 플레이리스트 감시 코드와 마찬가지로 비공식 페이지 구조를 파싱하는 거라,
-//      스포티파이가 페이지 구조를 바꾸면 정규식을 손봐야 할 수 있습니다.
+//    - 비공식 페이지 구조를 파싱하는 거라, 스포티파이가 페이지 구조를 바꾸면
+//      정규식을 손봐야 할 수 있습니다.
 
 // ==========================================
 // 1. 환경 변수 및 설정값
 // ==========================================
-const DISCORD_WEBHOOK_URL = " ";
-
-const TARGET_USER_ID = " "; // 👈 감시할 스포티파이 유저 ID로 교체하세요
+// ⚠️ 값을 여기에 직접 입력하지 마세요.
+// GAS 에디터 → 프로젝트 설정 → 스크립트 속성에서 관리하세요. (GitHub 유출 방지)
+const props = PropertiesService.getScriptProperties();
+const DISCORD_WEBHOOK_URL = props.getProperty("DISCORD_WEBHOOK_URL");
+const TARGET_USER_ID = props.getProperty("TARGET_USER_ID");
 
 const STATE_FILE_NAME = "spotify_user_monitor_state.json";
 
@@ -35,9 +46,15 @@ const STATE_FILE_NAME = "spotify_user_monitor_state.json";
 function loadState() {
   const files = DriveApp.getFilesByName(STATE_FILE_NAME);
   if (files.hasNext()) {
-    const state = JSON.parse(files.next().getBlob().getDataAsString());
-    if (!state.playlists) state.playlists = {};
-    return state;
+    // [수정] JSON 파싱 실패 시(파일 손상 등) 전체 스크립트가 죽는 문제 방어
+    try {
+      const state = JSON.parse(files.next().getBlob().getDataAsString());
+      if (!state.playlists) state.playlists = {};
+      return state;
+    } catch (e) {
+      console.error("상태 파일 파싱 실패. 초기 상태로 복구합니다:", e);
+      return { displayName: null, playlists: {} };
+    }
   }
   return { displayName: null, playlists: {} };
 }
@@ -55,12 +72,13 @@ function saveState(state) {
 // ==========================================
 // 3. 재귀적 트랙 + 플레이리스트 메타 추출
 // ==========================================
-// 플레이리스트 자기 자신(uri가 spotify:playlist:로 시작)을 만나면 이름을 meta에 저장하고,
-// 트랙(uri가 spotify:track:로 시작)을 만나면 tracksDict에 저장합니다.
-function extractTracksAndMeta(obj, tracksDict, meta) {
+// [수정] depth 파라미터 추가: 재귀가 지나치게 깊어질 경우 스택 오버플로우 방지
+function extractTracksAndMeta(obj, tracksDict, meta, depth) {
+  if (depth > 50) return;
+
   if (Array.isArray(obj)) {
     for (let i = 0; i < obj.length; i++) {
-      extractTracksAndMeta(obj[i], tracksDict, meta);
+      extractTracksAndMeta(obj[i], tracksDict, meta, depth + 1);
     }
   } else if (obj !== null && typeof obj === 'object') {
     if (typeof obj.uri === 'string') {
@@ -78,7 +96,7 @@ function extractTracksAndMeta(obj, tracksDict, meta) {
             id: trackId,
             name: title,
             artist: subtitle || '알 수 없는 가수',
-            link: ["https://", "open", ".spotify.com/track/", trackId].join("")
+            link: `https://open.spotify.com/track/${trackId}`
           };
         }
       } else if (obj.uri.startsWith('spotify:playlist:') && !meta.name) {
@@ -88,16 +106,18 @@ function extractTracksAndMeta(obj, tracksDict, meta) {
     }
 
     for (let key in obj) {
-      extractTracksAndMeta(obj[key], tracksDict, meta);
+      extractTracksAndMeta(obj[key], tracksDict, meta, depth + 1);
     }
   }
 }
 
-// 유저 프로필 페이지의 JSON 블록에서 플레이리스트 uri만 모으는 용도 (있을 경우를 대비한 1차 시도)
-function extractPlaylistRefs(obj, found) {
+// [수정] depth 파라미터 추가: 동일한 이유로 재귀 깊이 제한
+function extractPlaylistRefs(obj, found, depth) {
+  if (depth > 50) return;
+
   if (Array.isArray(obj)) {
     for (let i = 0; i < obj.length; i++) {
-      extractPlaylistRefs(obj[i], found);
+      extractPlaylistRefs(obj[i], found, depth + 1);
     }
   } else if (obj !== null && typeof obj === 'object') {
     if (typeof obj.uri === 'string' && obj.uri.startsWith('spotify:playlist:')) {
@@ -105,7 +125,7 @@ function extractPlaylistRefs(obj, found) {
       if (!found[id]) found[id] = true;
     }
     for (let key in obj) {
-      extractPlaylistRefs(obj[key], found);
+      extractPlaylistRefs(obj[key], found, depth + 1);
     }
   }
 }
@@ -114,7 +134,7 @@ function extractPlaylistRefs(obj, found) {
 // 4. 플레이리스트 임베드 파싱 (이름 + 트랙)
 // ==========================================
 function fetchPlaylistViaEmbed(playlistId) {
-  const embedUrl = ["https://", "open", ".spotify.com/embed/playlist/", playlistId].join("");
+  const embedUrl = `https://open.spotify.com/embed/playlist/${playlistId}`;
 
   const options = {
     method: "get",
@@ -138,7 +158,7 @@ function fetchPlaylistViaEmbed(playlistId) {
   const meta = { name: null };
   try {
     const data = JSON.parse(match[1]);
-    extractTracksAndMeta(data, tracksDict, meta);
+    extractTracksAndMeta(data, tracksDict, meta, 0); // [수정] depth 초기값 0 전달
   } catch (e) {
     console.error("플레이리스트 JSON 파싱 에러:", e);
     return null;
@@ -151,7 +171,7 @@ function fetchPlaylistViaEmbed(playlistId) {
 // 5. 유저 프로필 페이지 스크래핑 (이름 + 플레이리스트 목록)
 // ==========================================
 function fetchUserProfileViaScrape(userId) {
-  const profileUrl = ["https://", "open", ".spotify.com/user/", userId].join("");
+  const profileUrl = `https://open.spotify.com/user/${userId}`;
 
   const options = {
     method: "get",
@@ -186,7 +206,7 @@ function fetchUserProfileViaScrape(userId) {
   while ((scriptMatch = jsonScriptRegex.exec(html)) !== null) {
     try {
       const data = JSON.parse(scriptMatch[1]);
-      extractPlaylistRefs(data, foundFromJson);
+      extractPlaylistRefs(data, foundFromJson, 0); // [수정] depth 초기값 0 전달
     } catch (e) {
       // 이 스크립트 블록은 JSON이 아니거나 파싱 실패 → 무시하고 다음 블록 시도
     }
@@ -214,7 +234,7 @@ function fetchUserProfileViaScrape(userId) {
 // 6. 디스코드 임베드 빌더들
 // ==========================================
 function buildTrackChangeEmbed(playlistId, playlistName, added, removed) {
-  const playlistUrl = ["https://", "open", ".spotify.com/embed/playlist/", playlistId].join("");
+  const playlistUrl = `https://open.spotify.com/embed/playlist/${playlistId}`;
   let lines = [];
 
   Object.values(added).forEach(t => {
@@ -233,18 +253,18 @@ function buildTrackChangeEmbed(playlistId, playlistName, added, removed) {
     title: "플레이리스트가 변경 되었습니다",
     url: playlistUrl,
     description: text,
-    color: 1947988, // 스포티파이 초록
+    color: 1947988,
     timestamp: new Date().toISOString()
   };
 }
 
 function buildPlaylistAddedEmbed(playlistId, playlistName) {
-  const playlistUrl = ["https://", "open", ".spotify.com/playlist/", playlistId].join("");
+  const playlistUrl = `https://open.spotify.com/playlist/${playlistId}`;
   return {
     title: "📂 새 플레이리스트가 추가되었습니다",
     url: playlistUrl,
     description: `**[${playlistName}]** 플레이리스트가 프로필에 새로 추가되었습니다.`,
-    color: 3066993, // 초록
+    color: 3066993,
     timestamp: new Date().toISOString()
   };
 }
@@ -253,37 +273,35 @@ function buildPlaylistRemovedEmbed(playlistName) {
   return {
     title: "🗑️ 플레이리스트가 사라졌습니다",
     description: `**[${playlistName}]** 플레이리스트가 삭제되었거나, 비공개/프로필에서 제외되었습니다.`,
-    color: 15158332, // 빨강
+    color: 15158332,
     timestamp: new Date().toISOString()
   };
 }
 
 function buildPlaylistRenamedEmbed(playlistId, oldName, newName) {
-  const playlistUrl = ["https://", "open", ".spotify.com/playlist/", playlistId].join("");
+  const playlistUrl = `https://open.spotify.com/playlist/${playlistId}`;
   return {
     title: "✏️ 플레이리스트 이름이 변경되었습니다",
     url: playlistUrl,
     description: `**${oldName}** → **${newName}**`,
-    color: 15105570, // 주황
+    color: 15105570,
     timestamp: new Date().toISOString()
   };
 }
 
 function buildUserNameChangedEmbed(userId, oldName, newName) {
-  const profileUrl = ["https://", "open", ".spotify.com/user/", userId].join("");
+  const profileUrl = `https://open.spotify.com/user/${userId}`;
   return {
     title: "👤 유저 이름이 변경되었습니다",
     url: profileUrl,
     description: `**${oldName}** → **${newName}**`,
-    color: 10181046, // 보라
+    color: 10181046,
     timestamp: new Date().toISOString()
   };
 }
 
-// 임베드 배열을 한번에(혹은 10개 단위로 나눠서) 전송
 function sendDiscordEmbeds(embeds) {
   if (!embeds || embeds.length === 0) return;
-  // 디스코드는 메시지 1개당 임베드 최대 10개까지 허용
   for (let i = 0; i < embeds.length; i += 10) {
     const chunk = embeds.slice(i, i + 10);
     const options = {
@@ -300,8 +318,14 @@ function sendDiscordEmbeds(embeds) {
 // 7. 메인 감시 함수 (유저 단위)
 // ==========================================
 function monitorUser() {
+  // [수정] 스크립트 속성 누락 시 즉시 종료하여 null 관련 오류 방지
+  if (!DISCORD_WEBHOOK_URL || !TARGET_USER_ID) {
+    console.error("❌ 스크립트 속성이 설정되지 않았습니다. GAS 에디터 → 프로젝트 설정 → 스크립트 속성을 확인하세요.");
+    return;
+  }
+
   try {
-    const fullState = loadState(); // { displayName, playlists: { [id]: { name, tracks, pendingVerify } } }
+    const fullState = loadState();
     let isStateChanged = false;
     const embedsToSend = [];
 
@@ -327,7 +351,9 @@ function monitorUser() {
 
     const currentPlaylistIds = profile.playlistIds;
     const previousPlaylistIds = Object.keys(fullState.playlists);
-    const isFirstRun = previousPlaylistIds.length === 0;
+
+    // [수정] displayName 저장 여부도 함께 확인: 플레이리스트가 0개인 경우와 진짜 첫 실행을 구분
+    const isFirstRun = previousPlaylistIds.length === 0 && !fullState.displayName;
 
     const currentSet = {};
     currentPlaylistIds.forEach(id => { currentSet[id] = true; });
@@ -395,7 +421,6 @@ function monitorUser() {
           const addedCount = Object.keys(addedTracks).length;
           const removedCount = Object.keys(removedTracks).length;
 
-          // 대량 변동 시 1턴 대기 (서버 렉으로 인한 오탐 방지)
           if ((addedCount >= 5 || removedCount >= 5) && !state.pendingVerify) {
             console.log(`[${state.name}] 대량 변동 감지(추가 ${addedCount}, 삭제 ${removedCount}). 1턴 대기.`);
             state.pendingVerify = true;
