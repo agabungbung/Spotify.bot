@@ -46,17 +46,18 @@ const STATE_FILE_NAME = "spotify_user_monitor_state.json";
 function loadState() {
   const files = DriveApp.getFilesByName(STATE_FILE_NAME);
   if (files.hasNext()) {
-    // [수정] JSON 파싱 실패 시(파일 손상 등) 전체 스크립트가 죽는 문제 방어
     try {
       const state = JSON.parse(files.next().getBlob().getDataAsString());
       if (!state.playlists) state.playlists = {};
+      // [수정] pendingPlaylistVerify 필드 없으면 초기화 (기존 상태 파일 호환)
+      if (!state.hasOwnProperty('pendingPlaylistVerify')) state.pendingPlaylistVerify = null;
       return state;
     } catch (e) {
       console.error("상태 파일 파싱 실패. 초기 상태로 복구합니다:", e);
-      return { displayName: null, playlists: {} };
+      return { displayName: null, playlists: {}, pendingPlaylistVerify: null };
     }
   }
-  return { displayName: null, playlists: {} };
+  return { displayName: null, playlists: {}, pendingPlaylistVerify: null };
 }
 
 function saveState(state) {
@@ -72,7 +73,6 @@ function saveState(state) {
 // ==========================================
 // 3. 재귀적 트랙 + 플레이리스트 메타 추출
 // ==========================================
-// [수정] depth 파라미터 추가: 재귀가 지나치게 깊어질 경우 스택 오버플로우 방지
 function extractTracksAndMeta(obj, tracksDict, meta, depth) {
   if (depth > 50) return;
 
@@ -111,7 +111,6 @@ function extractTracksAndMeta(obj, tracksDict, meta, depth) {
   }
 }
 
-// [수정] depth 파라미터 추가: 동일한 이유로 재귀 깊이 제한
 function extractPlaylistRefs(obj, found, depth) {
   if (depth > 50) return;
 
@@ -158,7 +157,7 @@ function fetchPlaylistViaEmbed(playlistId) {
   const meta = { name: null };
   try {
     const data = JSON.parse(match[1]);
-    extractTracksAndMeta(data, tracksDict, meta, 0); // [수정] depth 초기값 0 전달
+    extractTracksAndMeta(data, tracksDict, meta, 0);
   } catch (e) {
     console.error("플레이리스트 JSON 파싱 에러:", e);
     return null;
@@ -206,7 +205,7 @@ function fetchUserProfileViaScrape(userId) {
   while ((scriptMatch = jsonScriptRegex.exec(html)) !== null) {
     try {
       const data = JSON.parse(scriptMatch[1]);
-      extractPlaylistRefs(data, foundFromJson, 0); // [수정] depth 초기값 0 전달
+      extractPlaylistRefs(data, foundFromJson, 0);
     } catch (e) {
       // 이 스크립트 블록은 JSON이 아니거나 파싱 실패 → 무시하고 다음 블록 시도
     }
@@ -318,7 +317,6 @@ function sendDiscordEmbeds(embeds) {
 // 7. 메인 감시 함수 (유저 단위)
 // ==========================================
 function monitorUser() {
-  // [수정] 스크립트 속성 누락 시 즉시 종료하여 null 관련 오류 방지
   if (!DISCORD_WEBHOOK_URL || !TARGET_USER_ID) {
     console.error("❌ 스크립트 속성이 설정되지 않았습니다. GAS 에디터 → 프로젝트 설정 → 스크립트 속성을 확인하세요.");
     return;
@@ -352,7 +350,6 @@ function monitorUser() {
     const currentPlaylistIds = profile.playlistIds;
     const previousPlaylistIds = Object.keys(fullState.playlists);
 
-    // [수정] displayName 저장 여부도 함께 확인: 플레이리스트가 0개인 경우와 진짜 첫 실행을 구분
     const isFirstRun = previousPlaylistIds.length === 0 && !fullState.displayName;
 
     const currentSet = {};
@@ -361,15 +358,52 @@ function monitorUser() {
     previousPlaylistIds.forEach(id => { previousSet[id] = true; });
 
     // --- 2) 목록에서 사라진 플레이리스트 감지 (삭제/비공개 전환 등) ---
-    previousPlaylistIds.forEach(id => {
-      if (!currentSet[id]) {
+
+    // [수정] 새벽 서버 점검 등으로 플리가 갑자기 0개로 반환될 때 즉시 스킵
+    if (currentPlaylistIds.length === 0 && previousPlaylistIds.length > 0) {
+      console.warn("⚠️ 플레이리스트가 갑자기 0개. 스크래핑 실패로 간주하고 이번 턴 스킵.");
+      return;
+    }
+
+    const removedIds = previousPlaylistIds.filter(id => !currentSet[id]);
+
+    if (!fullState.pendingPlaylistVerify) {
+      // 일반 모드: 2개 이상 동시 삭제면 1턴 대기
+      if (removedIds.length >= 2) {
+        console.log(`⏳ 플리 ${removedIds.length}개 동시 삭제 감지. 오작동 방지 위해 1턴 대기.`);
+        fullState.pendingPlaylistVerify = removedIds;
+        isStateChanged = true;
+      } else {
+        // 1개 이하 삭제는 즉시 처리
+        removedIds.forEach(id => {
+          const removedName = (fullState.playlists[id] && fullState.playlists[id].name) || "(알 수 없는 플레이리스트)";
+          console.log(`플레이리스트 사라짐 감지: ${removedName}`);
+          embedsToSend.push(buildPlaylistRemovedEmbed(removedName));
+          delete fullState.playlists[id];
+          isStateChanged = true;
+        });
+      }
+    } else {
+      // pendingVerify 모드: 2턴 연속 없어진 것만 진짜 삭제
+      const pendingIds = fullState.pendingPlaylistVerify;
+      const confirmed = pendingIds.filter(id => !currentSet[id]); // 여전히 없음 → 진짜 삭제
+      const recovered = pendingIds.filter(id => currentSet[id]);  // 돌아옴 → 오작동이었음
+
+      if (recovered.length > 0) {
+        console.log(`✅ 오작동 방지 성공! ${recovered.length}개 플리 복구됨 (스포티파이 일시 오류)`);
+      }
+
+      confirmed.forEach(id => {
         const removedName = (fullState.playlists[id] && fullState.playlists[id].name) || "(알 수 없는 플레이리스트)";
-        console.log(`플레이리스트 사라짐 감지: ${removedName}`);
+        console.log(`플레이리스트 사라짐 확정: ${removedName}`);
         embedsToSend.push(buildPlaylistRemovedEmbed(removedName));
         delete fullState.playlists[id];
         isStateChanged = true;
-      }
-    });
+      });
+
+      fullState.pendingPlaylistVerify = null;
+      isStateChanged = true;
+    }
 
     // --- 3) 현재 플레이리스트들 순회: 신규/트랙 변경/이름 변경 감지 ---
     for (const playlistId of currentPlaylistIds) {
